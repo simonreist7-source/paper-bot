@@ -2,6 +2,9 @@
 PAPER TRADER : gamma exposure (GEX) + flux d'ordres (delta), BTC perpetuel, donnees gratuites Deribit.
 AUCUN ORDRE REEL : positions virtuelles, journal CSV. Un appel de step() = un cycle (toutes les 15 min).
 
+v2 (2026-11-20) : la v1 n'a donne AUCUN signal en 205 cycles (regime NEG 100 % du temps, murs a 4 % / 12 % du spot,
+cassure exigee). Murs limites a +-3 % du spot, cassure NEG anticipee (tolerance 3 %, flux >= 0.10).
+Le compteur des 100 trades repart de zero avec la v2 (la v1 n'a produit aucun trade : rien n'est contamine).
 ================== REGLES FIGEES AVANT LE TEST (ne rien changer avant d'avoir 100 trades) ==================
 Contexte (GEX calcule sur toutes les options BTC <= 60 jours, convention : calls +, puts -) :
   regime POS = GEX net au spot > 0 (les teneurs de marche freinent les mouvements)
@@ -12,8 +15,9 @@ Flux : delta_ratio = (volume acheteur agressif - vendeur agressif) / volume tota
 Signaux (verifies a chaque cycle, une seule position a la fois) :
   POS (rebond sur les murs) : LONG  si spot <= put_wall  * 1.004 et delta_ratio >= +0.15
                               SHORT si spot >= call_wall * 0.996 et delta_ratio <= -0.15
-  NEG (cassure des murs)    : SHORT si spot <  put_wall  et delta_ratio <= -0.15
-                              LONG  si spot >  call_wall et delta_ratio >= +0.15
+  NEG (cassure des murs)    : SHORT si spot <  put_wall  * 1.03 et delta_ratio <= -0.10
+                              LONG  si spot >  call_wall * 0.97 et delta_ratio >= +0.10
+  (murs = strike de plus grand GEX dans une bande de +-3 % autour du spot)
 Sorties : stop 0.6 %, objectif 1.2 %, sortie temps 4 h. Stop avant objectif si les deux sont touches dans la meme minute.
 Couts : 5 bps de frais + 2 bps de glissement par execution (donc ~14 bps l'aller-retour).
 Verdict : a 100 trades clotures, moyenne nette > 0, p < 0.05, borne basse de l'IC > 0. A 60 trades : si t < -1, on arrete.
@@ -38,12 +42,15 @@ CURRENCY = "BTC"
 MAX_DAYS = 60
 WALL_TOL = 0.004
 FLOW_MIN = 0.15
+WALL_RANGE = 0.03                # murs cherches dans +-3 % du spot (v1 : toute la chaine, murs trop loin)
+NEG_TOL = 0.03                   # regime NEG : entree des que le spot est a moins de 3 % du mur, cote cassure
+NEG_FLOW = 0.10
 FLOW_WINDOW_MIN = 30
 STOP, TARGET = 0.006, 0.012
 MAX_HOLD_MIN = 240
 FEE, SLIP = 5e-4, 2e-4
 DATA = os.environ.get("PAPER_DATA", "data")     # sur Colab : un dossier Google Drive, sinon le journal disparait
-LOG, TRADES, STATE = f"{DATA}/paper_log.csv", f"{DATA}/paper_trades.csv", f"{DATA}/paper_state.json"
+LOG, TRADES, STATE = f"{DATA}/paper_log_v2.csv", f"{DATA}/paper_trades.csv", f"{DATA}/paper_state.json"   # v2 : nouvelle colonne 'bloque'
 ND = NormalDist()
 API = "https://www.deribit.com/api/v2/public"
 MONTHS = {m: i + 1 for i, m in enumerate("JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split())}
@@ -132,8 +139,8 @@ def gex_levels(summaries, spot, now_ts):
     strikes = np.unique(K)
     call_by = {k: per[(K == k) & (sg > 0)].sum() for k in strikes}
     put_by = {k: -per[(K == k) & (sg < 0)].sum() for k in strikes}
-    above = [k for k in strikes if k > spot]
-    below = [k for k in strikes if k < spot]
+    above = [k for k in strikes if spot < k <= spot * (1 + WALL_RANGE)]
+    below = [k for k in strikes if spot * (1 - WALL_RANGE) <= k < spot]
     call_wall = max(above, key=lambda k: call_by[k]) if above and max(call_by[k] for k in above) > 0 else None
     put_wall = max(below, key=lambda k: put_by[k]) if below and max(put_by[k] for k in below) > 0 else None
     grid = spot * (1 + np.linspace(-0.15, 0.15, 61))
@@ -167,11 +174,27 @@ def decide(spot, g, dr):
         if cw and spot >= cw * (1 - WALL_TOL) and dr <= -FLOW_MIN:
             return -1, "POS rejet mur call"
     else:
-        if pw and spot < pw and dr <= -FLOW_MIN:
+        if pw and spot < pw * (1 + NEG_TOL) and dr <= -NEG_FLOW:
             return -1, "NEG cassure mur put"
-        if cw and spot > cw and dr >= FLOW_MIN:
+        if cw and spot > cw * (1 - NEG_TOL) and dr >= NEG_FLOW:
             return 1, "NEG cassure mur call"
     return 0, ""
+
+
+def blocker(spot, g, dr):
+    """Pourquoi aucun signal ce cycle (colonne 'bloque' du journal)."""
+    if g is None:
+        return "pas_de_gex"
+    cw, pw = g["call_wall"], g["put_wall"]
+    if g["regime"] == "POS":
+        near, flow = (pw and spot <= pw * (1 + WALL_TOL)) or (cw and spot >= cw * (1 - WALL_TOL)), FLOW_MIN
+    else:
+        near, flow = (pw and spot < pw * (1 + NEG_TOL)) or (cw and spot > cw * (1 - NEG_TOL)), NEG_FLOW
+    if not pw and not cw:
+        return "aucun_mur"
+    if not near:
+        return "loin_des_murs"
+    return "flux_insuffisant" if abs(dr) < flow else "flux_sens_oppose"
 
 
 # ------------------------------------------------------------------ positions virtuelles
@@ -263,7 +286,8 @@ def step(client=None, now_ts=None):
     _append(LOG, dict(time=iso(now_ts), spot=round(spot, 2), regime=(g or {}).get("regime", ""),
                       net_gex=round((g or {}).get("net_gex", 0)), flip=round((g or {}).get("flip") or 0),
                       call_wall=(g or {}).get("call_wall") or "", put_wall=(g or {}).get("put_wall") or "",
-                      delta_ratio=round(dr, 3), n_trades=len(tr_list), signal=side, position=0 if not st["pos"] else st["pos"]["side"]))
+                      delta_ratio=round(dr, 3), n_trades=len(tr_list), signal=side, bloque="" if side else ("position_ouverte" if st["pos"] else blocker(spot, g, dr)),
+                      position=0 if not st["pos"] else st["pos"]["side"]))
     save_state(st)
     return msg
 
