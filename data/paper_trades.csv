@@ -12,3 +12,4 @@ t_entry,t_exit,side,entry,exit,reason,regime,why,gross_pct,net_pct
 2026-11-22 05:45:41,2026-11-22 06:06:00,SHORT,58661.28,59025.05,stop,NEG,NEG cassure mur put,-0.6201,-0.7201
 2026-11-23 05:45:43,2026-11-23 06:34:00,LONG,61704.2,61321.71,stop,NEG,NEG cassure mur call,-0.6199,-0.7199
 2026-11-23 16:31:03,2026-11-23 16:38:00,LONG,62666.57,62278.11,stop,NEG,NEG cassure mur call,-0.6199,-0.7199
+2026-11-23 16:45:50,2026-11-23 17:07:00,LONG,62114.95,61729.91,stop,NEG,NEG cassure mur call,-0.6199,-0.7199
